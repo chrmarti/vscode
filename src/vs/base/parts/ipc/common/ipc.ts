@@ -106,8 +106,9 @@ export class Server {
 			promise = Promise.wrapError(err);
 		}
 
+		// let stack;
+		// const start = Date.now();
 		const id = request.id;
-
 		const requestPromise = promise.then(data => {
 			this.protocol.send(<IRawResponse> { id, data, type: ResponseType.Success });
 			delete this.activeRequests[request.id];
@@ -124,6 +125,11 @@ export class Server {
 
 			delete this.activeRequests[request.id];
 		}, data => {
+			// if (!stack) {
+			// 	stack = true;
+			// 	console.log(new Error('here').stack);
+			// }
+			// console.log(`sending progress ${Date.now() - start}`);
 			this.protocol.send(<IRawResponse> { id, data, type: ResponseType.Progress });
 		});
 
@@ -189,6 +195,7 @@ export class Client implements IClient {
 	private doRequest(request: IRequest): Promise {
 		const id = request.raw.id;
 
+		// const start = Date.now();
 		return new Promise((c, e, p) => {
 			this.handlers[id] = response => {
 				switch (response.type) {
@@ -211,6 +218,7 @@ export class Client implements IClient {
 						break;
 
 					case ResponseType.Progress:
+						// console.log(`receiving progress ${Date.now() - start}`);
 						p(response.data);
 						break;
 				}

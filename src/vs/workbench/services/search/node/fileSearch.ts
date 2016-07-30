@@ -36,6 +36,8 @@ export class FileWalker {
 
 	private walkedPaths: { [path: string]: boolean; };
 
+	private throttler = new IOThrottler();
+
 	constructor(config: IRawSearch) {
 		this.config = config;
 		this.filePattern = config.filePattern;
@@ -93,7 +95,8 @@ export class FileWalker {
 			// For each root folder
 			flow.parallel(rootFolders, (absolutePath, perEntryCallback) => {
 				this.directoriesWalked++;
-				extfs.readdir(absolutePath, (error: Error, files: string[]) => {
+				this.throttler.run(cont => extfs.readdir(absolutePath, (error: Error, files: string[]) => {
+					cont();
 					if (error || this.isCanceled || this.isLimitHit) {
 						return perEntryCallback(null, null);
 					}
@@ -111,7 +114,7 @@ export class FileWalker {
 
 						return this.doWalk(paths.normalize(absolutePath), '', files, onResult, perEntryCallback);
 					});
-				});
+				}), 'readdir');
 			}, (err, result) => {
 				done(err ? err[0] : null, this.isLimitHit);
 			});
@@ -132,9 +135,10 @@ export class FileWalker {
 			return clb(false);
 		}
 
-		return fs.stat(this.filePattern, (error, stat) => {
+		return this.throttler.run(cont => fs.stat(this.filePattern, (error, stat) => {
+			cont();
 			return clb(!error && !stat.isDirectory(), stat && stat.size); // only existing files
-		});
+		}));
 	}
 
 	private checkFilePatternRelativeMatch(basePath: string, clb: (matchPath: string, size?: number) => void): void {
@@ -144,9 +148,10 @@ export class FileWalker {
 
 		const absolutePath = paths.join(basePath, this.filePattern);
 
-		return fs.stat(absolutePath, (error, stat) => {
+		return this.throttler.run(cont => fs.stat(absolutePath, (error, stat) => {
+			cont();
 			return clb(!error && !stat.isDirectory() ? absolutePath : null, stat && stat.size); // only existing files
-		});
+		}));
 	}
 
 	private doWalk(absolutePath: string, relativeParentPathWithSlashes: string, files: string[], onResult: (result: ISerializedFileMatch, size: number) => void, done: (error: Error, result: any) => void): void {
@@ -175,7 +180,8 @@ export class FileWalker {
 
 			// Use lstat to detect links
 			let currentAbsolutePath = [absolutePath, file].join(paths.sep);
-			fs.lstat(currentAbsolutePath, (error, lstat) => {
+			this.throttler.run(cont => fs.lstat(currentAbsolutePath, (error, lstat) => {
+				cont();
 				if (error || this.isCanceled || this.isLimitHit) {
 					return clb(null);
 				}
@@ -205,13 +211,14 @@ export class FileWalker {
 							this.walkedPaths[realpath] = true; // remember as walked
 
 							// Continue walking
-							return extfs.readdir(currentAbsolutePath, (error: Error, children: string[]): void => {
+							return this.throttler.run(cont => extfs.readdir(currentAbsolutePath, (error: Error, children: string[]): void => {
+								cont();
 								if (error || this.isCanceled || this.isLimitHit) {
 									return clb(null);
 								}
 
 								this.doWalk(currentAbsolutePath, currentRelativePathWithSlashes, children, onResult, clb);
-							});
+							}), 'readdir');
 						});
 					}
 
@@ -232,7 +239,7 @@ export class FileWalker {
 					// Unwind
 					return clb(null);
 				});
-			});
+			}));
 		}, (error: Error[]): void => {
 			if (error) {
 				error = arrays.coalesce(error); // find any error by removing null values first
@@ -244,6 +251,14 @@ export class FileWalker {
 
 	private matchFile(onResult: (result: ISerializedFileMatch, size: number) => void, absolutePath: string, relativePathWithSlashes: string, size?: number): void {
 		if (this.isFilePatternMatch(relativePathWithSlashes) && (!this.includePattern || glob.match(this.includePattern, relativePathWithSlashes))) {
+			// if (this.resultCount % 500 === 0) {
+			// 	console.log(JSON.stringify({
+			// 		sinceFileWalkStarted: Date.now() - this.fileWalkStartTime,
+			// 		results: this.resultCount,
+			// 		dirs: this.directoriesWalked,
+			// 		files: this.filesWalked
+			// 	}).replace(/"/g, ''));
+			// }
 			this.resultCount++;
 
 			if (this.maxResults && this.resultCount > this.maxResults) {
@@ -275,7 +290,11 @@ export class FileWalker {
 
 	private statLinkIfNeeded(path: string, lstat: fs.Stats, clb: (error: Error, stat: fs.Stats) => void): void {
 		if (lstat.isSymbolicLink()) {
-			return fs.stat(path, clb); // stat the target the link points to
+			// stat the target the link points to
+			return this.throttler.run(cont => fs.stat(path, (error, stat) => {
+				cont();
+				clb(error, stat);
+			}));
 		}
 
 		return clb(null, lstat); // not a link, so the stat is already ok for us
@@ -283,13 +302,10 @@ export class FileWalker {
 
 	private realPathIfNeeded(path: string, lstat: fs.Stats, clb: (error: Error, realpath?: string) => void): void {
 		if (lstat.isSymbolicLink()) {
-			return fs.realpath(path, (error, realpath) => {
-				if (error) {
-					return clb(error);
-				}
-
-				return clb(null, realpath);
-			});
+			return this.throttler.run(cont => fs.realpath(path, (error, realpath) => {
+				cont();
+				return clb(error, realpath);
+			}));
 		}
 
 		return clb(null, path);
@@ -320,4 +336,108 @@ export class Engine implements ISearchEngine {
 	public cancel(): void {
 		this.walker.cancel();
 	}
+}
+
+type Enqueue = (cont: () => void) => void;
+
+class IOThrottler {
+
+	constructor() {
+		// setInterval(() => {
+		// 	// console.log(`q${this.queues2.map(q => q.length)}, a${this.active2.map(q => q.length)}`);
+		// 	// console.log(`q${this.queues.map(q => q.length)}, a${this.active.length}`);
+		// 	console.log(`q${this.length3}, a${this.active3.length}`);
+		// }, 1000);
+	}
+
+	public run = this.run1;
+
+	public run0(enqueue?: Enqueue) {
+		enqueue(() => {});
+	}
+
+	private static MAX = 10;
+	private static LOW = 0;
+	private queues = [[], []];
+	private active = [];
+
+	public run1(enqueue?: Enqueue, op?: string) {
+		if (enqueue) {
+			this.queues[op === 'readdir' ? 1 : 0].push(enqueue);
+		}
+		while ((this.queues[0].length || this.queues[1].length) && this.active.length < IOThrottler.MAX) {
+			const i = (this.queues[0].length < IOThrottler.LOW && this.queues[1].length || !this.queues[0].length) ? 1 : 0;
+			const activate = this.queues[i].shift();
+			execute(this.active, activate, () => this.run());
+		}
+	}
+
+	private static MAX2 = [10, 5];
+	private static LOW2 = 10;
+	private queues2 = [[], []];
+	private active2 = [[], []];
+
+	public run2(enqueue?: Enqueue, op?: string) {
+		if (enqueue) {
+			this.queues2[op === 'readdir' ? 1 : 0].push(enqueue);
+		}
+		for (let i = 0; i < 2; i++) {
+			while (this.queues2[i].length && this.active2[i].length < IOThrottler.MAX2[i] && (i === 0 || this.queues2[0].length < IOThrottler.LOW2)) {
+				const activate = this.queues2[i].shift();
+				execute(this.active2[i], activate, () => this.run());
+			}
+		}
+	}
+
+	private static MAX3 = 10;
+	private head3 = [];
+	private tail3 = this.head3;
+	private empty3 = this.tail3;
+	private length3 = 0;
+	private active3 = [];
+
+	public run3(enqueue?: Enqueue, op?: string) {
+		if (enqueue) {
+			const last = this.tail3;
+			last[0] = enqueue;
+			if (!last[1]) {
+				last[1] = [];
+				this.empty3 = last[1];
+			}
+			this.tail3 = last[1];
+			this.length3++;
+		}
+		while (this.head3[0] && this.active3.length < IOThrottler.MAX3) {
+			const activate = this.head3[0];
+			const old = this.head3;
+			this.head3 = this.head3[1];
+			old.length = 0;
+			this.empty3[1] = old;
+			this.empty3 = old;
+			this.length3--;
+			execute(this.active3, activate, () => this.run());
+		}
+	}
+
+	// private static MAX3 = 10;
+	// private queue3 = [];
+	// private active3 = [];
+
+	// public run3(enqueue?: Enqueue, op?: string) {
+	// 	if (enqueue) {
+	// 		this.queue3.push(enqueue);
+	// 	}
+	// 	while (this.queue3.length && this.active3.length < IOThrottler.MAX3) {
+	// 		const activate = this.queue3.shift();
+	// 		execute(this.active3, activate, () => this.run());
+	// 	}
+	// }
+}
+
+function execute(active: Enqueue[], activate: Enqueue, cont: () => void) {
+	activate(() => {
+		active.splice(active.indexOf(activate), 1);
+		cont();
+	});
+	active.push(activate);
 }

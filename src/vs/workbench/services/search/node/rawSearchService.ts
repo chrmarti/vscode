@@ -47,6 +47,7 @@ export class SearchService implements IRawSearchService {
 					if (batchSize) {
 						batch.push(match);
 						if (batchSize > 0 && batch.length >= batchSize) {
+							// console.log('progress!');
 							p(batch);
 							batch = [];
 						}

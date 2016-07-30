@@ -242,8 +242,12 @@ export class DiskSearch {
 
 	public static collectResults(request: PPromise<ISerializedSearchComplete, ISerializedSearchProgressItem>): PPromise<ISearchComplete, ISearchProgressItem> {
 		let result: IFileMatch[] = [];
+		const start = Date.now();
 		return new PPromise<ISearchComplete, ISearchProgressItem>((c, e, p) => {
 			request.done((complete) => {
+				console.log(`walker start: ${complete.stats.fileWalkStartTime - start}`);
+				console.log(`walker end: ${complete.stats.fileWalkResultTime - start}`);
+				console.log(`receive: ${Date.now() - start}`);
 				c({
 					limitHit: complete.limitHit,
 					results: result,
@@ -253,6 +257,12 @@ export class DiskSearch {
 
 				// Matches
 				if (Array.isArray(data)) {
+					// if (!result.length) {
+					// 	console.log(new Error('here').stack);
+					// }
+					// if (result.length % 1000 === 0) {
+						// console.log(`received: ${Date.now() - start} ${result.length}`);
+					// }
 					const fileMatches = data.map(d => this.createFileMatch(d));
 					result = result.concat(fileMatches);
 					fileMatches.forEach(p);
